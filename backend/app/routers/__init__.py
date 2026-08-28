@@ -7,6 +7,7 @@ from .excel_doc import router as excel_doc_router
 from .chat import router as chat_router
 from .agent import router as agent_router
 from .agent_template import router as agent_template_router
+from .memory import router as memory_router
 
 __all__ = [
     "knowledge_base_router",
@@ -18,4 +19,5 @@ __all__ = [
     "chat_router",
     "agent_router",
     "agent_template_router",
+    "memory_router",
 ]

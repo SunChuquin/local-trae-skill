@@ -13,6 +13,7 @@ from app.routers import (
     chat_router,
     agent_router,
     agent_template_router,
+    memory_router,
 )
 from app.utils.logger import logger
 from app.config import settings
@@ -85,6 +86,7 @@ app.include_router(excel_doc_router)
 app.include_router(chat_router)
 app.include_router(agent_router)
 app.include_router(agent_template_router)
+app.include_router(memory_router)
 
 
 @app.get("/")

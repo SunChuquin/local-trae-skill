@@ -63,3 +63,4 @@ models/
 _src_jc/
 _src_iso/
 _tmp_chroma_test/
+/kb.json

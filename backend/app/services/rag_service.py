@@ -5,6 +5,7 @@ from app.services.chroma_service import chroma_service
 from app.services.storage import skill_config_storage, knowledge_base_storage
 from app.models.skill import RetrievalResult, RetrievalRequest
 from app.services.vector_utils import vector_utils
+from app.services.memory_service import memory_service, INTERNAL_PREFIX
 
 
 class RAGService:
@@ -104,6 +105,30 @@ class RAGService:
         logger.info(f'top_k: {top_k}, threshold: {threshold}');
 
         try:
+            # 持久化记忆：精确命中（一字不差）直接返回缓存答案；近似命中作为参考上下文
+            memory_hits = []
+            try:
+                memory_hits = memory_service.search(query)
+            except Exception as e:
+                logger.warning(f"查询问答记忆失败（忽略，继续正常检索）: {e}")
+
+            exact_hits = [h for h in memory_hits if h.get("exact")]
+            if exact_hits:
+                hit = exact_hits[0]
+                logger.info(f"命中问答记忆（一字不差）: 相似度={hit['similarity']}，直接返回缓存答案")
+                return [RetrievalResult(
+                    document_id="memory",
+                    document_name="问答记忆",
+                    content=hit["answer"],
+                    similarity=hit["similarity"],
+                    metadata={
+                        "memory": True,
+                        "exact": True,
+                        "question": hit["question"],
+                        "created_at": hit.get("created_at"),
+                    },
+                )]
+
             processed_query = vector_utils.preprocess_for_chunk(query)
             logger.info(f'预处理后查询: {processed_query}');
             
@@ -117,6 +142,8 @@ class RAGService:
                     logger.warning(f"未找到知识库 '{knowledge_base_name}' 的ID，直接使用名称作为集合名")
             else:
                 collection_names = chroma_service.list_collections()
+                # 排除内部集合（如问答记忆 mem_qa），避免污染普通检索
+                collection_names = [c for c in collection_names if not c.startswith(INTERNAL_PREFIX)]
 
             if not collection_names:
                 logger.warning("没有找到任何知识库")
@@ -199,6 +226,25 @@ class RAGService:
             
             filtered_results = [r for r in all_results if r.similarity >= threshold]
             final_results = filtered_results[:top_k]
+
+            # 近似记忆命中：作为参考上下文附带给上层 Agent，由它判断是否真是用户所问
+            for hit in memory_hits:
+                if hit.get("exact"):
+                    continue
+                if hit["similarity"] >= threshold:
+                    final_results.append(RetrievalResult(
+                        document_id="memory",
+                        document_name="问答记忆（参考）",
+                        content=hit["answer"],
+                        similarity=hit["similarity"],
+                        metadata={
+                            "memory": True,
+                            "reference": True,
+                            "question": hit["question"],
+                            "created_at": hit.get("created_at"),
+                        },
+                    ))
+                    logger.info(f"附加近似记忆参考: 相似度={hit['similarity']}")
 
             logger.info(f"检索完成: 共{len(all_results)}条原始结果, 阈值{threshold}过滤后{len(filtered_results)}条, 返回{len(final_results)}条")
             logger.info('========== 检索结束 ==========');
