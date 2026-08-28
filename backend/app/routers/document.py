@@ -1,5 +1,7 @@
 from typing import List
 from datetime import datetime
+import asyncio
+import time
 import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
@@ -16,6 +18,7 @@ from app.services.document_parser import document_parser
 from app.services.advanced_chunker import advanced_chunker
 from app.services.chroma_service import chroma_service
 from app.services.storage import document_storage, knowledge_base_storage, storage
+from app.services.upload_tracker import upload_tracker
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -73,6 +76,26 @@ def _get_kb_doc_count(kb_id: str) -> int:
     )
     
     return doc_count + excel_count
+
+
+# 上传串行锁：一次只允许一个文档进入处理流程，其余排队等待，避免并发向量化打满 CPU
+_upload_lock = asyncio.Lock()
+
+
+async def _serialized_process_upload(
+    knowledge_base_id: str, file_type: str, filename: str, content: bytes, task_id: str
+) -> None:
+    """按锁串行地执行文档处理；等不到锁时任务保持 queued 状态并提示排队。"""
+    upload_tracker.update(
+        task_id, status="queued", phase="queued",
+        message="排队等待处理（系统一次只处理一个文档，前面的完成即自动开始）",
+    )
+    async with _upload_lock:
+        # asyncio.to_thread 是 Python 3.9+ 才有，3.8 用 run_in_executor 替代
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, _process_upload, knowledge_base_id, file_type, filename, content, task_id
+        )
 
 
 @router.post("/", response_model=DocumentResponse)
@@ -159,7 +182,7 @@ async def create_document(doc_data: DocumentCreate):
     )
 
 
-@router.post("/upload", response_model=DocumentResponse)
+@router.post("/upload")
 async def upload_document(
     knowledge_base_id: str = Form(...),
     file: UploadFile = File(...)
@@ -172,23 +195,63 @@ async def upload_document(
     if file_type not in ['md', 'txt', 'pdf', 'docx']:
         raise HTTPException(status_code=400, detail="不支持的文件类型")
 
-    temp_dir = Path("./data/temp")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_file = temp_dir / file.filename
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="文件内容为空")
 
+    # 立即返回任务号，实际处理在后台线程中执行，避免阻塞服务并支持进度查询
+    task_id = str(uuid.uuid4())
+    upload_tracker.create(task_id, file.filename)
+
+    # 串行处理：一次只向量化一个文档，其余任务排队等待，避免 CPU 并发打满卡死
+    asyncio.get_running_loop().create_task(
+        _serialized_process_upload(knowledge_base_id, file_type, file.filename, content, task_id)
+    )
+
+    return {
+        "code": 202,
+        "message": "文档处理已开始",
+        "data": {"task_id": task_id, "filename": file.filename},
+    }
+
+
+@router.get("/upload-tasks")
+async def list_upload_tasks():
+    """列出所有上传/索引任务（含进行中与已完成的），供进度终端等客户端轮询。"""
+    tasks = upload_tracker.list_tasks()
+    return {"code": 200, "message": "success", "data": tasks, "total": len(tasks)}
+
+
+@router.get("/upload-progress/{task_id}")
+async def get_upload_progress(task_id: str):
+    state = upload_tracker.public_state(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"code": 200, "message": "success", "data": state}
+
+
+def _process_upload(knowledge_base_id: str, file_type: str, filename: str, content: bytes, task_id: str) -> None:
+    """在后台线程中执行文档处理（解析→分块→向量化→写入），并持续上报进度。"""
     try:
-        content = await file.read()
+        upload_tracker.update(task_id, status="processing", phase="parsing", done=0, total=0,
+                              message="解析文档内容...")
+
+        temp_dir = Path("./data/temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = temp_dir / filename
         temp_file.write_bytes(content)
 
         text_content = document_parser.parse_file(str(temp_file), file_type)
         if not text_content:
-            raise HTTPException(status_code=500, detail="文档解析失败")
+            upload_tracker.update(task_id, status="error", phase="error", message="文档解析失败",
+                                  error="解析结果为空")
+            return
 
         doc_id = str(uuid.uuid4())
         now = datetime.now()
         doc = Document(
             id=doc_id,
-            name=file.filename,
+            name=filename,
             content=text_content,
             document_type=DocumentType(file_type),
             knowledge_base_id=knowledge_base_id,
@@ -200,8 +263,10 @@ async def upload_document(
             updated_at=now
         )
 
-        chunks = document_parser.chunk_text(text_content, doc_id, file.filename)
+        upload_tracker.update(task_id, phase="chunking", total=0, done=0, message="文本分块处理中...")
+        chunks = document_parser.chunk_text(text_content, doc_id, filename)
         doc.chunk_count = len(chunks)
+        total = len(chunks)
 
         if chunks:
             metadatas = [
@@ -209,42 +274,56 @@ async def upload_document(
                     "document_id": chunk["document_id"],
                     "document_name": chunk["document_name"],
                     "chunk_index": chunk["chunk_index"],
-                    "total_chunks": chunk["total_chunks"]
+                    "total_chunks": chunk["total_chunks"],
+                    "page": chunk.get("page") or 0,
+                    "source": chunk.get("source", chunk["document_name"]),
                 }
                 for chunk in chunks
             ]
             texts = [chunk["text"] for chunk in chunks]
+            ids = [chunk["id"] for chunk in chunks]
 
-            success = chroma_service.add_vectors(
+            upload_tracker.update(task_id, phase="embedding", total=total, done=0,
+                                  phase_started_at=time.time(),
+                                  message=f"生成向量嵌入（0/{total}）...")
+
+            def _on_batch(inc: int) -> None:
+                state = upload_tracker.bump(task_id, inc)
+                n = state["done"]
+                upload_tracker.update(task_id, message=f"生成向量嵌入（{n}/{total}）...")
+
+            success = chroma_service.add_vectors_progress(
                 collection_name=knowledge_base_id,
                 documents=texts,
                 metadatas=metadatas,
-                ids=[chunk["id"] for chunk in chunks]
+                ids=ids,
+                batch_size=16,
+                progress_cb=_on_batch,
             )
 
             if success:
                 doc.vector_count = len(chunks)
             else:
-                raise HTTPException(status_code=500, detail="向量存储失败")
+                upload_tracker.update(task_id, status="error", phase="error", message="向量存储失败",
+                                      error="chroma 写入失败")
+                return
 
+        upload_tracker.update(task_id, phase="saving", message="保存文档元数据...")
         document_storage.set(doc_id, doc.model_dump())
-        
+
         kb_data = knowledge_base_storage.get(knowledge_base_id)
         if kb_data:
             kb_data['document_count'] = _get_kb_doc_count(knowledge_base_id)
             kb_data['updated_at'] = now.isoformat()
             knowledge_base_storage.set(knowledge_base_id, kb_data)
 
-        logger.info(f"上传文档: {file.filename} (ID: {doc_id})")
-
-        return DocumentResponse(
-            code=200,
-            message="文档上传成功",
-            data=doc
-        )
-    finally:
-        if temp_file.exists():
-            temp_file.unlink()
+        logger.info(f"上传文档: {filename} (ID: {doc_id})")
+        upload_tracker.update(task_id, status="done", phase="done", done=total, percent=100,
+                              message="处理完成")
+    except Exception as e:
+        logger.exception(f"后台处理文档失败 {filename}")
+        upload_tracker.update(task_id, status="error", phase="error", message=f"处理失败: {str(e)}",
+                              error=str(e))
 
 
 @router.get("/knowledge-base/{kb_id}", response_model=DocumentListResponse)
@@ -306,7 +385,9 @@ async def update_document(doc_id: str, doc_data: DocumentUpdate):
                     "document_id": chunk["document_id"],
                     "document_name": chunk["document_name"],
                     "chunk_index": chunk["chunk_index"],
-                    "total_chunks": chunk["total_chunks"]
+                    "total_chunks": chunk["total_chunks"],
+                    "page": chunk.get("page") or 0,
+                    "source": chunk.get("source", chunk["document_name"]),
                 }
                 for chunk in chunks
             ]

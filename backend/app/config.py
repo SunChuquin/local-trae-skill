@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 150
 
+    # 上传处理并发上限：一次只处理一个文档（默认1），避免 CPU 并发向量化卡死
+    max_concurrent_uploads: int = 1
+
     default_top_k: int = 5
     default_similarity_threshold: float = 0.4
 

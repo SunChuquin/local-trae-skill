@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 import uuid
 from datetime import datetime
 from loguru import logger
@@ -13,11 +13,11 @@ class ChromaService:
         self.client = None
         self._initialize_client()
     
-    # HNSW 索引优化参数（基于数据规模调整）
+    # HNSW 索引优化参数（基于数据规模调整；chromadb 0.5.x 参数命名）
     INDEX_CONFIG = {
         "hnsw:space": "cosine",  # 使用余弦距离
-        "hnsw:ef_construction": 200,  # 索引构建精度（越高越精确但越慢）
-        "hnsw:ef_search": 100,  # 搜索精度（越高越精确但越慢）
+        "hnsw:construction_ef": 200,  # 索引构建精度（越高越精确但越慢）
+        "hnsw:search_ef": 100,  # 搜索精度（越高越精确但越慢）
         "hnsw:M": 16  # 邻居数量（平衡精度和内存）
     }
 
@@ -104,6 +104,46 @@ class ChromaService:
             logger.error(f"获取集合失败 {collection_name}: {str(e)}")
             return None
 
+    def get_or_create_collection(self, collection_name: str):
+        """获取集合，不存在则自动创建（带优化索引配置）。
+        若创建失败，清理可能残留的半创建集合后重试一次。"""
+        try:
+            collection = self.client.get_collection(name=collection_name)
+            return collection
+        except Exception:
+            # 集合不存在 → 创建
+            try:
+                metadata = {
+                    "created_at": datetime.now().isoformat(),
+                    **self.INDEX_CONFIG
+                }
+                collection = self.client.create_collection(
+                    name=collection_name,
+                    metadata=metadata,
+                )
+                logger.info(f"自动创建集合（优化配置）: {collection_name}")
+                return collection
+            except Exception as e:
+                # 创建失败：清理可能残留的半创建集合（collection 已建但 segment 未建）
+                logger.warning(f"自动创建集合失败 {collection_name}: {str(e)}，尝试清理残留后重试")
+                try:
+                    self.client.delete_collection(name=collection_name)
+                except Exception:
+                    pass
+                try:
+                    collection = self.client.create_collection(
+                        name=collection_name,
+                        metadata={
+                            "created_at": datetime.now().isoformat(),
+                            **self.INDEX_CONFIG
+                        },
+                    )
+                    logger.info(f"重试创建集合成功: {collection_name}")
+                    return collection
+                except Exception as e2:
+                    logger.error(f"重试创建集合仍失败 {collection_name}: {str(e2)}")
+                    return None
+
     def list_collections(self) -> List[str]:
         try:
             collections = self.client.list_collections()
@@ -130,6 +170,43 @@ class ChromaService:
 
             # 生成向量
             embeddings = embedding_service.get_embeddings(documents)
+
+            collection.add(
+                documents=documents,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"添加 {len(documents)} 个向量到集合 {collection_name}")
+            return True
+        except Exception as e:
+            logger.error(f"添加向量失败: {str(e)}")
+            return False
+
+    def add_vectors_progress(
+        self,
+        collection_name: str,
+        documents: List[str],
+        metadatas: List[Dict[str, Any]],
+        ids: Optional[List[str]] = None,
+        batch_size: int = 16,
+        progress_cb: Optional[Callable[[int], None]] = None,
+    ) -> bool:
+        """分批向量化并写入，progress_cb(本批数量) 逐批回调，用于上报真实进度。"""
+        try:
+            collection = self.get_or_create_collection(collection_name)
+            if not collection:
+                logger.error(f"集合不存在或创建失败: {collection_name}")
+                return False
+
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in documents]
+
+            embeddings = embedding_service.get_embeddings_batch_progress(
+                documents,
+                batch_size=batch_size,
+                on_batch=progress_cb,
+            )
 
             collection.add(
                 documents=documents,

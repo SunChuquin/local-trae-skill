@@ -525,10 +525,16 @@ function Documents() {
       
       try {
         await documentApi.upload(selectedKb, file, (progress) => {
+          const globalPercent = Math.round((i + (progress.percent / 100)) / fileArray.length * 100);
+          let message = `[${i + 1}/${fileArray.length}] ${progress.message}`;
+          if (progress.estimateSeconds && progress.estimateSeconds > 1) {
+            const mins = Math.ceil(progress.estimateSeconds / 60);
+            message += mins >= 1 ? `（预计还需约 ${mins} 分钟）` : `（预计还需约 ${progress.estimateSeconds} 秒）`;
+          }
           setUploadProgress({
-            phase: 'processing',
-            percent: Math.round((i + (progress.percent / 100)) / fileArray.length * 100),
-            message: `处理 ${i + 1}/${fileArray.length}: ${file.name}`
+            phase: progress.phase === 'done' ? 'done' : progress.phase,
+            percent: globalPercent,
+            message,
           });
         });
         successCount++;

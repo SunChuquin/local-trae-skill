@@ -24,6 +24,7 @@ wheels/
 venv/
 env/
 ENV/
+.venv310/
 
 # IDE
 .vscode/
@@ -57,3 +58,8 @@ Thumbs.db
 
 # Models
 models/
+
+# Other
+_src_jc/
+_src_iso/
+_tmp_chroma_test/

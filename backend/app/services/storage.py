@@ -1,4 +1,7 @@
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, TypeVar, Generic
 from datetime import datetime
@@ -12,6 +15,9 @@ class JSONStorage:
     def __init__(self, filename: str):
         self.filepath: Path = settings.get_data_path() / filename
         self._data: Dict[str, Any] = {}
+        # 写锁：多个后台线程可能同时 set/delete，必须串行化且原子落盘，
+        # 否则并发写或进程被中断会导致 JSON 文件损坏、全量数据丢失。
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -28,9 +34,21 @@ class JSONStorage:
             logger.info(f"数据文件 {self.filepath} 不存在，创建新存储")
 
     def _save(self) -> bool:
+        """原子写盘：先写临时文件再 os.replace，避免写一半被中断导致整个文件损坏。"""
         try:
-            with open(self.filepath, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2, default=self._json_serializer)
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.filepath.parent), suffix='.tmp'
+            )
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(self._data, f, ensure_ascii=False, indent=2,
+                              default=self._json_serializer)
+                os.replace(tmp_path, self.filepath)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
             return True
         except Exception as e:
             logger.error(f"保存数据失败: {str(e)}")
@@ -47,14 +65,16 @@ class JSONStorage:
         return self._data.get(key)
 
     def set(self, key: str, value: Any) -> bool:
-        self._data[key] = value
-        return self._save()
+        with self._lock:
+            self._data[key] = value
+            return self._save()
 
     def delete(self, key: str) -> bool:
-        if key in self._data:
-            del self._data[key]
-            return self._save()
-        return True
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+                return self._save()
+            return True
 
     def get_all(self) -> Dict[str, Any]:
         return self._data.copy()
@@ -63,8 +83,9 @@ class JSONStorage:
         return len(self._data)
 
     def clear(self) -> bool:
-        self._data = {}
-        return self._save()
+        with self._lock:
+            self._data = {}
+            return self._save()
 
 
 knowledge_base_storage = JSONStorage("knowledge_bases.json")

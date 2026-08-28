@@ -1,11 +1,15 @@
-@echo off
+﻿@echo off
 echo ============================================
 echo 个人私有文档 Skill 系统启动脚本
 echo ============================================
 
+rem 优先使用 .venv310（Python 3.10 环境），否则回退全局 python
+set "PY=python"
+if exist "%~dp0.venv310\Scripts\python.exe" set "PY=%~dp0.venv310\Scripts\python.exe"
+
 echo.
 echo [1/4] 检查 Python 环境...
-python --version
+%PY% --version
 if errorlevel 1 (
     echo 错误: 未找到 Python，请先安装 Python 3.10+
     pause
@@ -15,7 +19,7 @@ if errorlevel 1 (
 echo.
 echo [2/4] 安装后端依赖...
 cd backend
-pip install -r requirements.txt
+%PY% -m pip install -r requirements.txt
 if errorlevel 1 (
     echo 错误: 依赖安装失败
     pause
@@ -25,7 +29,7 @@ cd ..
 
 echo.
 echo [3/4] 启动后端服务...
-start "后端服务" cmd /k "cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload"
+start "后端服务" cmd /k "cd backend && %PY% -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload"
 
 timeout /t 5 /nobreak > nul
 

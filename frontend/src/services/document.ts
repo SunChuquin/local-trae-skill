@@ -5,6 +5,7 @@ export interface UploadProgress {
   phase: 'upload' | 'processing' | 'done';
   percent: number;
   message: string;
+  estimateSeconds?: number | null;
 }
 
 interface ApiResponse<T> {
@@ -42,76 +43,66 @@ export const documentApi = {
     kbId: string,
     file: File,
     onProgress?: (progress: UploadProgress) => void
-  ): Promise<Document> => {
+  ): Promise<void> => {
     const formData = new FormData();
     formData.append('knowledge_base_id', kbId);
     formData.append('file', file);
 
-    let processingTimer: number | null = null;
+    onProgress?.({ phase: 'upload', percent: 0, message: '准备上传...', estimateSeconds: null });
 
-    const reportProgress = (phase: UploadProgress['phase'], percent: number, message: string) => {
-      onProgress?.({ phase, percent, message });
-    };
-
-    reportProgress('upload', 0, '准备上传...');
-
+    // 1) 上传文件：后端只保存文件并创建后台任务，立即返回任务号
+    let res: any;
     try {
-      const response = await api.post<ApiResponse<Document>>('/documents/upload', formData, {
+      res = await api.post<ApiResponse<{ task_id?: string; filename?: string }>>('/documents/upload', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
+        timeout: 0, // 上传请求不做硬超时限制
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
             const uploadPercent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-            reportProgress('upload', Math.min(uploadPercent, 40), `上传文件中... ${uploadPercent}%`);
+            onProgress?.({
+              phase: 'upload',
+              percent: Math.min(uploadPercent, 40),
+              message: `上传文件中... ${uploadPercent}%`,
+              estimateSeconds: null,
+            });
           }
         },
       });
-
-      reportProgress('processing', 42, '文件已上传，等待后端处理...');
-
-      await new Promise<void>((resolve) => {
-        let simulatedPercent = 42;
-        const phases = [
-          { at: 48, msg: '解析文档内容...' },
-          { at: 58, msg: '文本分块处理中...' },
-          { at: 70, msg: '生成向量嵌入...' },
-          { at: 82, msg: '写入向量数据库...' },
-          { at: 92, msg: '即将完成...' },
-        ];
-        let phaseIdx = 0;
-
-        processingTimer = setInterval(() => {
-          if (simulatedPercent < 92) {
-            simulatedPercent += 1;
-            if (phaseIdx < phases.length && simulatedPercent >= phases[phaseIdx].at) {
-              reportProgress('processing', simulatedPercent, phases[phaseIdx].msg);
-              phaseIdx++;
-            } else {
-              reportProgress('processing', simulatedPercent, '');
-            }
-          } else {
-            clearInterval(processingTimer!);
-            processingTimer = null;
-            resolve();
-          }
-        }, 200);
-      });
-
-      if (processingTimer) {
-        clearInterval(processingTimer!);
-        processingTimer = null;
-      }
-
-      reportProgress('done', 100, '完成');
-      return (response as unknown as ApiResponse<Document>).data;
-
     } catch (error) {
-      if (processingTimer) {
-        clearInterval(processingTimer);
-        processingTimer = null;
+      throw new Error(`上传失败: ${(error as Error)?.message ?? error}`);
+    }
+
+    const taskId = res?.data?.task_id;
+    if (!taskId) throw new Error('未获取到处理任务，上传失败');
+
+    // 2) 轮询后台处理进度，用真实进度替换旧的模拟进度
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      let poll: any;
+      try {
+        poll = await api.get(`/documents/upload-progress/${taskId}`);
+      } catch (error) {
+        throw new Error('查询处理进度失败');
       }
-      throw error;
+
+      const state = poll?.data ?? {};
+      if (state.status === 'done') {
+        onProgress?.({ phase: 'done', percent: 100, message: '处理完成', estimateSeconds: 0 });
+        return;
+      }
+      if (state.status === 'error') {
+        throw new Error(state.error || state.message || '文档处理失败');
+      }
+      onProgress?.({
+        phase: 'processing',
+        percent: state.percent ?? 0,
+        message: state.message ?? '处理中...',
+        estimateSeconds: state.estimate_seconds ?? null,
+      });
     }
   },
 };
