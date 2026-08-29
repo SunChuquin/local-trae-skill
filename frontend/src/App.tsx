@@ -1,5 +1,5 @@
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import './index.css';
 import { cn } from './lib/utils';
 import { Button } from './components/ui/button';
@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './com
 import { Input } from './components/ui/input';
 import { Textarea } from './components/ui/textarea';
 import { Progress } from './components/ui/progress';
-import { BookOpen, FileText, Database, Settings, Bug, BarChart3, Plus, Trash2, Upload, File, Search, Play, MessageSquare, Send, Bot, User, X, Brain } from 'lucide-react';
+import { BookOpen, FileText, Database, Settings, Bug, BarChart3, Plus, Trash2, Upload, File, Search, Play, MessageSquare, Send, Bot, User, X, Brain, Bookmark, Check } from 'lucide-react';
 import { knowledgeBaseApi } from './services/knowledgeBase';
 import { documentApi, UploadProgress } from './services/document';
 import { vectorApi } from './services/vector';
@@ -22,6 +22,7 @@ import { Document } from './types/document';
 import { ExcelDocument, ChunkMode } from './types/excel_document';
 import { ChatMessage, ChatConfig, StreamChatEvent } from './types/chat';
 import { useChat } from './hooks/useChat';
+import { memoryApi, MemoryRecord } from './services/memory';
 
 function Dashboard() {
   const [stats, setStats] = useState({ kbCount: 0, docCount: 0, vectorCount: 0 });
@@ -503,8 +504,35 @@ function Documents() {
       return;
     }
     
-    const fileArray = Array.from(files);
+    let fileArray = Array.from(files);
     if (fileArray.length === 0) return;
+    
+    // 过滤已完整上传的同名文件，防止重复向量化（vector_count >= chunk_count > 0 视为已完整上传）
+    const existingNames = new Set<string>();
+    try {
+      const existing = await documentApi.list(selectedKb);
+      existing.forEach((d) => {
+        if (d.vector_count >= d.chunk_count && d.chunk_count > 0) {
+          existingNames.add(d.name);
+        }
+      });
+      const alreadyUploaded = fileArray.filter((f) => existingNames.has(f.name));
+      fileArray = fileArray.filter((f) => !existingNames.has(f.name));
+      if (alreadyUploaded.length > 0) {
+        setUploadProgress({
+          phase: 'upload',
+          percent: 0,
+          message: `已跳过 ${alreadyUploaded.length} 个已上传文件：${alreadyUploaded.map((f) => f.name).join('、')}`,
+        });
+      }
+    } catch (error) {
+      console.error('获取已入库文档失败，本次上传不做去重:', error);
+    }
+    
+    if (fileArray.length === 0) {
+      alert('所选文件均已完整上传，无需重复上传。');
+      return;
+    }
     
     setLoading(true);
     setUploadingFiles(fileArray);
@@ -1695,6 +1723,9 @@ function Chat(props: ChatProps) {
     clearChat
   } = props;
 
+  // 已保存到问答记忆的助手消息索引（用于按钮反馈）
+  const [savedMemoryIndexes, setSavedMemoryIndexes] = useState<Set<number>>(new Set());
+
   useEffect(() => {
     loadConfig();
   }, []);
@@ -1720,6 +1751,30 @@ function Chat(props: ChatProps) {
     } catch (error) {
       console.error('Failed to save config:', error);
       alert('配置保存失败');
+    }
+  };
+
+  // 保存一条助手回答到问答记忆：取该回答之前最近的一条用户提问作为问题
+  const handleSaveMemory = async (messageIndex: number, answer: string) => {
+    const lastUserMessage = [...messages.slice(0, messageIndex)]
+      .reverse()
+      .find((m) => m.role === 'user');
+    const question = lastUserMessage?.content?.trim();
+    if (!question) {
+      alert('未找到对应的问题，无法保存记忆');
+      return;
+    }
+    try {
+      const ok = await memoryApi.save(question, answer);
+      if (ok) {
+        setSavedMemoryIndexes((prev) => new Set(prev).add(messageIndex));
+        alert('已保存到问答记忆');
+      } else {
+        alert('保存失败');
+      }
+    } catch (error) {
+      console.error('保存问答记忆失败:', error);
+      alert('保存失败');
     }
   };
 
@@ -2119,6 +2174,19 @@ function Chat(props: ChatProps) {
                   )}
                 >
                   <p className="whitespace-pre-wrap text-sm">{message.content}</p>
+                  {message.role === 'assistant' && message.content && (
+                    <button
+                      onClick={() => handleSaveMemory(index, message.content)}
+                      className="mt-2 inline-flex items-center gap-1 text-xs text-gray-400 hover:text-blue-600 transition-colors"
+                    >
+                      {savedMemoryIndexes.has(index) ? (
+                        <Check className="h-3 w-3" />
+                      ) : (
+                        <Bookmark className="h-3 w-3" />
+                      )}
+                      {savedMemoryIndexes.has(index) ? '已记住' : '记住这次回答'}
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
@@ -2304,6 +2372,110 @@ function Chat(props: ChatProps) {
               </div>
             </CardContent>
           </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MemoryManagement() {
+  const [records, setRecords] = useState<MemoryRecord[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const loadMemories = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await memoryApi.list(200, 0);
+      setRecords(data);
+    } catch (error) {
+      console.error('加载问答记忆失败:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMemories();
+  }, [loadMemories]);
+
+  const handleDelete = async (id: string) => {
+    if (!window.confirm('确定删除这条记忆吗？删除后不可恢复。')) return;
+    try {
+      const ok = await memoryApi.remove(id);
+      if (ok) {
+        setRecords((prev) => prev.filter((r) => r.id !== id));
+      } else {
+        alert('删除失败，记忆可能不存在');
+      }
+    } catch (error) {
+      console.error('删除问答记忆失败:', error);
+      alert('删除失败');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold">问答记忆</h1>
+          <p className="text-muted-foreground">
+            管理已保存的问答记忆（共 {records.length} 条）
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={loadMemories}>
+          刷新
+        </Button>
+      </div>
+
+      {loading ? (
+        <Card>
+          <CardContent className="p-6 text-center text-muted-foreground">加载中...</CardContent>
+        </Card>
+      ) : records.length === 0 ? (
+        <Card>
+          <CardContent className="p-6 text-center text-muted-foreground">
+            暂无记忆。可在「AI 对话」中对助手回答点击"记住这次回答"保存。
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-3">
+          {records.map((rec) => (
+            <Card key={rec.id}>
+              <CardContent className="p-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex-1 space-y-2 min-w-0">
+                    <div className="flex items-start gap-2">
+                      <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded shrink-0 mt-0.5">
+                        问题
+                      </span>
+                      <span className="font-medium text-sm break-words">{rec.question}</span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded shrink-0 mt-0.5">
+                        回答
+                      </span>
+                      <p className="text-sm text-gray-700 whitespace-pre-wrap break-words line-clamp-4">
+                        {rec.answer}
+                      </p>
+                    </div>
+                    {rec.created_at && (
+                      <p className="text-xs text-muted-foreground">
+                        保存时间：{new Date(rec.created_at).toLocaleString()}
+                      </p>
+                    )}
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => handleDelete(rec.id)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
         </div>
       )}
     </div>
@@ -2722,6 +2894,7 @@ function App() {
             <Route path="/knowledge-bases" element={<KnowledgeBases />} />
             <Route path="/documents" element={<Documents />} />
             <Route path="/chat" element={<Chat {...chatState} />} />
+            <Route path="/memories" element={<MemoryManagement />} />
             <Route path="/excel-documents" element={<ExcelDocuments />} />
             <Route path="/vector" element={<VectorManagement />} />
             <Route path="/skill" element={<SkillConfig />} />

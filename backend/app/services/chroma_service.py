@@ -93,6 +93,11 @@ class ChromaService:
             logger.info(f"删除集合: {collection_name}")
             return True
         except Exception as e:
+            # 集合不存在视为删除成功（目标本就是删除它，集合已不存在即已达成），
+            # 避免上层因找不到集合而误判失败（如 --all 清理后记录仍在但集合已被清空）
+            if "does not exist" in str(e):
+                logger.info(f"集合不存在，视为已删除: {collection_name}")
+                return True
             logger.error(f"删除集合失败 {collection_name}: {str(e)}")
             return False
 

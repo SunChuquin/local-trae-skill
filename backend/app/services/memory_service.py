@@ -125,5 +125,49 @@ class MemoryService:
             logger.error(f"获取记忆条数失败: {e}")
             return 0
 
+    def list_all(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """列出所有已存记忆（含 id/问题/答案/时间），按创建时间倒序。"""
+        collection = chroma_service.get_collection(self.MEMORY_COLLECTION)
+        if collection is None:
+            return []
+        try:
+            data = collection.get(include=["documents", "metadatas"])
+            ids = data.get("ids", []) or []
+            documents = data.get("documents", []) or []
+            metadatas = data.get("metadatas", []) or []
+
+            records: List[Dict[str, Any]] = []
+            for i, doc in enumerate(documents):
+                meta = metadatas[i] if i < len(metadatas) else {}
+                if meta.get("type") != "qa":
+                    continue
+                records.append({
+                    "id": ids[i] if i < len(ids) else "",
+                    "question": meta.get("question", doc),
+                    "answer": meta.get("answer", ""),
+                    "created_at": meta.get("created_at"),
+                    "source_note": meta.get("source_note"),
+                })
+            records.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+            return records[offset:offset + limit]
+        except Exception as e:
+            logger.error(f"列出问答记忆失败: {e}")
+            return []
+
+    def delete(self, mem_id: str) -> bool:
+        """按 id 删除一条记忆。"""
+        if not mem_id:
+            return False
+        collection = chroma_service.get_collection(self.MEMORY_COLLECTION)
+        if collection is None:
+            return False
+        try:
+            collection.delete(ids=[mem_id])
+            logger.info(f"删除问答记忆: {mem_id}")
+            return True
+        except Exception as e:
+            logger.error(f"删除问答记忆失败 {mem_id}: {e}")
+            return False
+
 
 memory_service = MemoryService()

@@ -60,3 +60,24 @@ async def count_memory():
         "message": "success",
         "data": {"count": memory_service.count()},
     }
+
+
+@router.get("/list")
+async def list_memory(limit: int = 100, offset: int = 0):
+    records = memory_service.list_all(limit=limit, offset=offset)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": records,
+        "total": len(records),
+    }
+
+
+@router.delete("/{mem_id}")
+async def delete_memory(mem_id: str):
+    ok = memory_service.delete(mem_id)
+    return {
+        "code": 200 if ok else 404,
+        "message": "删除成功" if ok else "记忆不存在或删除失败",
+        "data": {"deleted": ok},
+    }
