@@ -23,6 +23,9 @@ from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
+# 剔除前后文本的临时预览目录（供前端"剔除预览"页对比检查）
+CLEAN_PREVIEW_DIR = Path("./data/temp_clean")
+
 
 def _parse_datetime(value):
     if isinstance(value, datetime):
@@ -241,7 +244,17 @@ def _process_upload(knowledge_base_id: str, file_type: str, filename: str, conte
         temp_file = temp_dir / filename
         temp_file.write_bytes(content)
 
-        text_content = document_parser.parse_file(str(temp_file), file_type)
+        # PDF 解析时同时产出"剔除前"原始文本与"剔除后"文本，写入临时预览目录，
+        # 供前端"剔除预览"页对比检查页眉页脚剔除是否正确
+        if file_type == "pdf":
+            parse_result = document_parser.parse_file(str(temp_file), file_type, keep_original=True)
+            if parse_result:
+                orig_text, text_content = parse_result
+                CLEAN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+                (CLEAN_PREVIEW_DIR / f"{filename}.original.md").write_text(orig_text, encoding="utf-8")
+                (CLEAN_PREVIEW_DIR / f"{filename}.cleaned.md").write_text(text_content, encoding="utf-8")
+        else:
+            text_content = document_parser.parse_file(str(temp_file), file_type)
         if not text_content:
             upload_tracker.update(task_id, status="error", phase="error", message="文档解析失败",
                                   error="解析结果为空")

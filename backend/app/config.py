@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # 上传处理并发上限：一次只处理一个文档（默认1），避免 CPU 并发向量化卡死
     max_concurrent_uploads: int = 1
 
+    # 是否启用定时摘要更新任务（默认关闭；改为 true 可恢复每 24 小时自动更新知识库摘要）
+    schedule_summary_enabled: bool = False
+
     default_top_k: int = 5
     default_similarity_threshold: float = 0.4
 

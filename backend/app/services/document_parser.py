@@ -13,7 +13,7 @@ class DocumentParser:
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
 
-    def parse_file(self, file_path: str, file_type: str) -> Optional[str]:
+    def parse_file(self, file_path: str, file_type: str, keep_original: bool = False) -> Optional[str]:
         try:
             path = Path(file_path)
             if not path.exists():
@@ -25,7 +25,8 @@ class DocumentParser:
             elif file_type == "txt":
                 return self.parse_txt(file_path)
             elif file_type == "pdf":
-                return self.parse_pdf(file_path)
+                # keep_original=True 时返回 (原始文本, 剔除页眉页脚后文本)
+                return self.parse_pdf(file_path, keep_original=keep_original)
             elif file_type == "docx":
                 return self.parse_docx(file_path)
             else:
@@ -55,28 +56,47 @@ class DocumentParser:
             logger.error(f"解析文本文件失败: {str(e)}")
             raise
 
-    def parse_pdf(self, file_path: str) -> str:
-        """解析 PDF：用 pdfplumber 保表格结构。
+    # 页眉/页脚判定：文本行在页面顶部/底部的边缘比例（相对页高）
+    _EDGE_RATIO_TOP = 0.10
+    _EDGE_RATIO_BOTTOM = 0.08
+    # 用于页眉/页脚匹配的数字归一化（页眉常含页码，如 "… v1.1 3/122"，去掉数字差异才能识别重复）
+    _NUM_RE = re.compile(r'\d+')
 
-        策略：
-        1. 普通文本按页提取，每页以 【第N页】 标记（溯源）；
-        2. 表格用 pdfplumber 提取为 Markdown（保留列结构，保表格）；
-        3. 表格上方若紧跟编号/标题（如 "Table 4 — ..."），将其并入表格块
-           （编号同 chunk），并整体用 <<<TABLE>>>...<<<END_TABLE>>> 包裹，
-           使后续分块时表格保持原子性不被切散；
-        4. 表格文字从普通文本流中剔除，避免重复。
+    def parse_pdf(self, file_path: str, keep_original: bool = False):
+        """解析 PDF：用 pdfplumber 保表格结构，并剔除跨页重复的页眉页脚。
+
+        流程：
+        1. 逐页提取"结构化事件"（带坐标的文本行 + 表格块）；
+        2. 统计所有页面顶部/底部边缘重复出现的文本行，识别页眉/页脚；
+        3. 剔除页眉页脚后组装文本（每页以 【第N页】 标记溯源，表格用
+           <<<TABLE>>>...<<<END_TABLE>>> 包裹保持原子性）。
+
+        keep_original=True 时返回 (原始文本, 剔除后文本) 元组，供对比预览用；
+        默认返回剔除后的文本字符串。
         """
         try:
             import pdfplumber
-            text_parts = []
+            pages = []
             with pdfplumber.open(file_path) as pdf:
                 for pno, page in enumerate(pdf.pages, 1):
-                    page_content = self._extract_page(page, pno)
-                    if page_content:
-                        text_parts.append(page_content)
-            content = "\n".join(text_parts)
-            logger.info(f"解析 PDF 文件: {file_path}，提取 {len(text_parts)} 页（pdfplumber 保表格）")
-            return content
+                    pages.append(self._extract_page_structured(page, pno))
+            headers, footers = self._detect_headers_footers(pages)
+            cleaned_parts = []
+            for pno, height, events in pages:
+                rendered = self._render_page(pno, height, events, headers, footers)
+                if rendered:
+                    cleaned_parts.append(rendered)
+            cleaned = "\n".join(cleaned_parts)
+            logger.info(f"解析 PDF 文件: {file_path}，提取 {len(cleaned_parts)} 页（pdfplumber 保表格）")
+            if keep_original:
+                # 剔除前：不做页眉/页脚过滤的完整渲染（表格处理逻辑一致，便于对比）
+                orig_parts = []
+                for pno, height, events in pages:
+                    rendered = self._render_page(pno, height, events, set(), set())
+                    if rendered:
+                        orig_parts.append(rendered)
+                return "\n".join(orig_parts), cleaned
+            return cleaned
         except Exception as e:
             logger.error(f"解析 PDF 失败: {str(e)}")
             raise
@@ -85,14 +105,12 @@ class DocumentParser:
 
     _CAPTION_RE = re.compile(r'^(Table|Figure|表|图)\s*[\d.]+', re.I)
 
-    def _extract_page(self, page, pno: int) -> str:
-        """提取单页，将表格渲染为 Markdown 并按其纵向位置插入到文本流中。"""
-        header = f"【第{pno}页】\n"
-        tables = page.find_tables()
-        if not tables:
-            txt = page.extract_text()
-            return header + (txt or "")
+    def _extract_page_structured(self, page, pno: int):
+        """提取单页为结构化事件列表：文本行 (top, bottom, text) + 表格 (top, table, idx)。
 
+        保留坐标供页眉/页脚识别；表格以独立事件保留，不参与页眉页脚判定。
+        """
+        tables = page.find_tables()
         words = page.extract_words(x_tolerance=1.5, y_tolerance=3)
         tb = [t.bbox for t in tables]
 
@@ -105,12 +123,51 @@ class DocumentParser:
 
         outside = [w for w in words if not in_table(w)]
         lines = self._group_lines(outside)  # list of (top, bottom, text)
-
-        events = [line for line in lines]  # (top, bottom, text)
+        events = [line for line in lines]
         for t_idx, t in enumerate(tables):
             events.append((t.bbox[1], t.bbox[1], t, t_idx))  # (top, _, table, idx)
         events.sort(key=lambda e: e[0])
+        return (pno, page.height, events)
 
+    def _norm_header_text(self, text: str) -> str:
+        """把文本中的数字序列归一化为 '#'，用于跨页统计页眉/页脚重复
+        （页眉常含页码，归一化后才能把 '… 3/122'、'4/122 …' 合并为同一页眉）。"""
+        return self._NUM_RE.sub('#', text.strip())
+
+    def _detect_headers_footers(self, pages):
+        """跨页统计页面顶部/底部边缘重复出现的文本行，识别页眉/页脚。
+
+        文本先做数字归一化再统计（页眉常含页码，逐页不同需归一化）；
+        仅当文本行位于页面边缘 且 在多页重复出现（>= 一半页数 且 至少 2 页）时，
+        才判定为页眉/页脚，避免误删正文。
+        """
+        from collections import Counter
+        total = len(pages)
+        if total < 2:
+            return set(), set()
+        top_counter = Counter()
+        bottom_counter = Counter()
+        for _pno, height, events in pages:
+            for ev in events:
+                if not isinstance(ev[2], str):
+                    continue
+                top, bottom, text = ev[0], ev[1], self._norm_header_text(ev[2])
+                if not text:
+                    continue
+                if top < height * self._EDGE_RATIO_TOP:
+                    top_counter[text] += 1
+                elif bottom > height * (1 - self._EDGE_RATIO_BOTTOM):
+                    bottom_counter[text] += 1
+        threshold = max(2, int(total * 0.5))
+        headers = {t for t, c in top_counter.items() if c >= threshold}
+        footers = {t for t, c in bottom_counter.items() if c >= threshold}
+        if headers or footers:
+            logger.info(f"识别到页眉 {len(headers)} 条、页脚 {len(footers)} 条，向量化前剔除")
+        return headers, footers
+
+    def _render_page(self, pno: int, height, events, headers, footers) -> str:
+        """把结构化事件组装为页面文本，剔除页眉/页脚，表格渲染为 Markdown。"""
+        header = f"【第{pno}页】\n"
         out = []
         for i, ev in enumerate(events):
             if not isinstance(ev[2], str):
@@ -123,7 +180,20 @@ class DocumentParser:
                 else:
                     out.append(f"<<<TABLE|第{pno}页>>>\n{md}\n<<<END_TABLE>>>")
             else:
-                out.append(ev[2])
+                top, bottom, text = ev[0], ev[1], ev[2].strip()
+                if not text:
+                    continue
+                # 剔除页眉/页脚（仅当边缘位置 + 跨页重复都命中，文本先做数字归一化匹配）
+                if top < height * self._EDGE_RATIO_TOP:
+                    n = self._norm_header_text(text)
+                    # 完全匹配 或 为某识别页眉的前缀（处理部分页面页眉无页码的情况）
+                    if n in headers or any(h.startswith(n) for h in headers):
+                        continue
+                if bottom > height * (1 - self._EDGE_RATIO_BOTTOM) and self._norm_header_text(text) in footers:
+                    continue
+                out.append(text)
+        if not out:
+            return ""
         return header + "\n".join(out)
 
     def _group_lines(self, words):

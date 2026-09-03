@@ -14,6 +14,7 @@ from app.routers import (
     agent_router,
     agent_template_router,
     memory_router,
+    clean_preview_router,
 )
 from app.utils.logger import logger
 from app.config import settings
@@ -27,7 +28,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"服务地址: http://{settings.host}:{settings.port}")
     logger.info("=" * 50)
     
-    await schedule_task.start()
+    if settings.schedule_summary_enabled:
+        await schedule_task.start()
     
     yield
     
@@ -87,6 +89,7 @@ app.include_router(chat_router)
 app.include_router(agent_router)
 app.include_router(agent_template_router)
 app.include_router(memory_router)
+app.include_router(clean_preview_router)
 
 
 @app.get("/")

@@ -188,6 +188,37 @@ class ChromaService:
             logger.error(f"添加向量失败: {str(e)}")
             return False
 
+    def upsert_vectors(
+        self,
+        collection_name: str,
+        documents: List[str],
+        metadatas: List[Dict[str, Any]],
+        ids: Optional[List[str]] = None
+    ) -> bool:
+        """写入向量，id 已存在时覆盖（更新文档/向量/metadata），用于记忆去重更新。"""
+        try:
+            collection = self.get_collection(collection_name)
+            if not collection:
+                logger.error(f"集合不存在: {collection_name}")
+                return False
+
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in documents]
+
+            embeddings = embedding_service.get_embeddings(documents)
+
+            collection.upsert(
+                documents=documents,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"Upsert {len(documents)} 个向量到集合 {collection_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Upsert 向量失败: {str(e)}")
+            return False
+
     def add_vectors_progress(
         self,
         collection_name: str,

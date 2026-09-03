@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './com
 import { Input } from './components/ui/input';
 import { Textarea } from './components/ui/textarea';
 import { Progress } from './components/ui/progress';
-import { BookOpen, FileText, Database, Settings, Bug, BarChart3, Plus, Trash2, Upload, File, Search, Play, MessageSquare, Send, Bot, User, X, Brain, Bookmark, Check } from 'lucide-react';
+import { BookOpen, FileText, Database, Settings, Bug, BarChart3, Plus, Trash2, Upload, File, Search, Play, MessageSquare, Send, Bot, User, X, Brain, Bookmark, Check, Eye } from 'lucide-react';
 import { knowledgeBaseApi } from './services/knowledgeBase';
 import { documentApi, UploadProgress } from './services/document';
 import { vectorApi } from './services/vector';
@@ -23,6 +23,7 @@ import { ExcelDocument, ChunkMode } from './types/excel_document';
 import { ChatMessage, ChatConfig, StreamChatEvent } from './types/chat';
 import { useChat } from './hooks/useChat';
 import { memoryApi, MemoryRecord } from './services/memory';
+import { cleanPreviewApi, CleanPreviewItem } from './services/cleanPreview';
 
 function Dashboard() {
   const [stats, setStats] = useState({ kbCount: 0, docCount: 0, vectorCount: 0 });
@@ -460,6 +461,7 @@ function Documents() {
   const [uploadingFiles, setUploadingFiles] = useState<File[]>([]);
   const [uploadedCount, setUploadedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
+  const [failedFiles, setFailedFiles] = useState<string[]>([]);
   const [selectedDocumentVectors, setSelectedDocumentVectors] = useState<any>(null);
   const [loadingVectors, setLoadingVectors] = useState(false);
 
@@ -538,6 +540,7 @@ function Documents() {
     setUploadingFiles(fileArray);
     setUploadedCount(0);
     setFailedCount(0);
+    setFailedFiles([]);
     setUploadProgress({ phase: 'upload', percent: 0, message: `准备上传 0/${fileArray.length}...` });
     
     let successCount = 0;
@@ -569,6 +572,7 @@ function Documents() {
       } catch (error) {
         console.error(`Failed to upload ${file.name}:`, error);
         failCount++;
+        setFailedFiles((prev) => [...prev, file.name]);
       }
       
       setUploadedCount(successCount);
@@ -605,6 +609,7 @@ function Documents() {
       setUploadingFiles([]);
       setUploadedCount(0);
       setFailedCount(0);
+      setFailedFiles([]);
     }, 2000);
   };
 
@@ -823,10 +828,20 @@ function Documents() {
                   <Progress value={uploadProgress.percent} />
                   
                   {uploadingFiles.length > 1 && (
-                    <div className="flex justify-between text-xs">
-                      <span className="text-emerald-600">成功: {uploadedCount}</span>
-                      <span className="text-red-600">失败: {failedCount}</span>
-                    </div>
+                    <>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-emerald-600">成功: {uploadedCount}</span>
+                        <span className="text-red-600">失败: {failedCount}</span>
+                      </div>
+                      {failedFiles.length > 0 && (
+                        <div className="text-xs text-red-600 space-y-0.5">
+                          <div className="font-medium">失败文件：</div>
+                          {failedFiles.map((name) => (
+                            <div key={name} className="truncate">• {name}</div>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               )}
@@ -2482,6 +2497,173 @@ function MemoryManagement() {
   );
 }
 
+function CleanPreviewPage() {
+  const [items, setItems] = useState<CleanPreviewItem[]>([]);
+  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [original, setOriginal] = useState('');
+  const [cleaned, setCleaned] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [loadingContent, setLoadingContent] = useState(false);
+
+  const loadList = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await cleanPreviewApi.list();
+      setItems(data);
+      if (data.length > 0) {
+        setSelectedName((prev) => prev && data.some((d) => d.name === prev) ? prev : data[0].name);
+      } else {
+        setSelectedName(null);
+        setOriginal('');
+        setCleaned('');
+      }
+    } catch (error) {
+      console.error('加载剔除预览列表失败:', error);
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadList();
+  }, [loadList]);
+
+  // 默认打开第一个
+  useEffect(() => {
+    if (!selectedName && items.length > 0) {
+      setSelectedName(items[0].name);
+    }
+  }, [items, selectedName]);
+
+  useEffect(() => {
+    if (!selectedName) {
+      setOriginal('');
+      setCleaned('');
+      return;
+    }
+    let cancelled = false;
+    setLoadingContent(true);
+    Promise.all([
+      cleanPreviewApi.content(selectedName, 'original'),
+      cleanPreviewApi.content(selectedName, 'cleaned'),
+    ])
+      .then(([o, c]) => {
+        if (cancelled) return;
+        setOriginal(o);
+        setCleaned(c);
+      })
+      .catch((error) => {
+        console.error('加载剔除预览内容失败:', error);
+        if (!cancelled) {
+          setOriginal('');
+          setCleaned('');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingContent(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedName]);
+
+  const removedChars = original.length - cleaned.length;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold">剔除预览</h1>
+          <p className="text-muted-foreground">
+            检查上传 PDF 的页眉/页脚剔除是否正确（共 {items.length} 个文件）
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={loadList}>
+          刷新
+        </Button>
+      </div>
+
+      {loading ? (
+        <Card>
+          <CardContent className="p-6 text-center text-muted-foreground">加载中...</CardContent>
+        </Card>
+      ) : items.length === 0 ? (
+        <Card>
+          <CardContent className="p-6 text-center text-muted-foreground">
+            暂无剔除预览。请先上传 PDF 文档，系统会同时保存剔除前/后的文本供对比。
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="flex gap-6 h-[calc(100vh-220px)] min-h-[480px]">
+          {/* 左侧文件列表 */}
+          <div className="w-64 shrink-0 border rounded-lg overflow-y-auto bg-card">
+            {items.map((item) => (
+              <button
+                key={item.name}
+                onClick={() => setSelectedName(item.name)}
+                className={`w-full text-left px-3 py-2.5 text-sm border-b last:border-b-0 transition-colors ${
+                  selectedName === item.name
+                    ? 'bg-blue-50 text-blue-700 font-medium'
+                    : 'text-gray-700 hover:bg-gray-50'
+                }`}
+                title={item.name}
+              >
+                <div className="flex items-center gap-2">
+                  <FileText className="h-4 w-4 shrink-0" />
+                  <span className="truncate">{item.name}</span>
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* 右侧对比面板 */}
+          <div className="flex-1 min-w-0 flex flex-col space-y-4">
+            {selectedName && (
+              <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                <span className="font-medium text-gray-800 truncate">{selectedName}</span>
+                <span className="shrink-0">
+                  剔除前 {original.length} 字 → 剔除后 {cleaned.length} 字
+                </span>
+                {removedChars > 0 ? (
+                  <span className="shrink-0 text-emerald-600">已剔除 {removedChars} 字</span>
+                ) : (
+                  <span className="shrink-0 text-amber-600">未识别到页眉/页脚</span>
+                )}
+              </div>
+            )}
+
+            {loadingContent ? (
+              <Card>
+                <CardContent className="p-6 text-center text-muted-foreground">加载中...</CardContent>
+              </Card>
+            ) : (
+              <div className="flex-1 min-h-0 grid grid-cols-2 gap-4">
+                <div className="flex flex-col min-h-0">
+                  <div className="text-xs font-medium text-muted-foreground mb-1">
+                    剔除前（原始提取）
+                  </div>
+                  <pre className="flex-1 min-h-0 overflow-auto border rounded-lg p-3 text-xs leading-relaxed bg-card whitespace-pre-wrap break-words">
+                    {original || '（空）'}
+                  </pre>
+                </div>
+                <div className="flex flex-col min-h-0">
+                  <div className="text-xs font-medium text-emerald-600 mb-1">
+                    剔除后（页眉/页脚已去除）
+                  </div>
+                  <pre className="flex-1 min-h-0 overflow-auto border rounded-lg p-3 text-xs leading-relaxed bg-card whitespace-pre-wrap break-words">
+                    {cleaned || '（空）'}
+                  </pre>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DebugPanel() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<any[]>([]);
@@ -2831,6 +3013,24 @@ function App() {
                 文档管理
               </Button>
             </Link>
+            <Link to="/clean-preview">
+              <Button
+                variant={location.pathname === '/clean-preview' ? 'secondary' : 'ghost'}
+                className="w-full justify-start"
+              >
+                <Eye className="mr-2 h-4 w-4" />
+                剔除预览
+              </Button>
+            </Link>
+            <Link to="/memories">
+              <Button
+                variant={location.pathname === '/memories' ? 'secondary' : 'ghost'}
+                className="w-full justify-start"
+              >
+                <Bookmark className="mr-2 h-4 w-4" />
+                记忆管理
+              </Button>
+            </Link>
             <Link to="/chat">
               <Button
                 variant={location.pathname === '/chat' ? 'secondary' : 'ghost'}
@@ -2893,6 +3093,7 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/knowledge-bases" element={<KnowledgeBases />} />
             <Route path="/documents" element={<Documents />} />
+            <Route path="/clean-preview" element={<CleanPreviewPage />} />
             <Route path="/chat" element={<Chat {...chatState} />} />
             <Route path="/memories" element={<MemoryManagement />} />
             <Route path="/excel-documents" element={<ExcelDocuments />} />

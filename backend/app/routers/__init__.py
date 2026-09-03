@@ -8,6 +8,7 @@ from .chat import router as chat_router
 from .agent import router as agent_router
 from .agent_template import router as agent_template_router
 from .memory import router as memory_router
+from .clean_preview import router as clean_preview_router
 
 __all__ = [
     "knowledge_base_router",
@@ -20,4 +21,5 @@ __all__ = [
     "agent_router",
     "agent_template_router",
     "memory_router",
+    "clean_preview_router",
 ]

@@ -54,7 +54,8 @@ class MemoryService:
         if source_note:
             metadata["source_note"] = source_note
 
-        ok = chroma_service.add_vectors(
+        # 用 upsert：同一问题（sha1 固定 id）再次保存时覆盖旧答案并刷新时间，而非重复插入/报错
+        ok = chroma_service.upsert_vectors(
             collection_name=self.MEMORY_COLLECTION,
             documents=[q],
             metadatas=[metadata],
